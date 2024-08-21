@@ -1,0 +1,22 @@
+[package]
+name = "proxbin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+rand = "0.8.5"
+serde = { version = "1.0", optional = true, default-features = false, features = [
+  "derive",
+] }
+serde_bytes = { version = "0.11", optional = true, default-features = false }
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[features]
+serde = ["dep:serde", "dep:serde_bytes"]
+
+[[bench]]
+name = "benchmark"
+harness = false
