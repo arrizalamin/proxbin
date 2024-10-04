@@ -7,4 +7,5 @@ mod hnsw;
 pub mod metric;
 
 pub use hnsw::params::HNSWParams;
-pub use hnsw::{BinaryVector, HNSWData, HNSW};
+pub use hnsw::storage;
+pub use hnsw::{BinaryVector, HNSW};

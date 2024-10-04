@@ -5,7 +5,7 @@ use proxbin::{BinaryVector, HNSW};
 use rand::Rng;
 
 fn bench_insert(c: &mut Criterion) {
-    let mut index = HNSW::<u32, 32>::new();
+    let mut hnsw = HNSW::<u32, 32>::default();
     let mut rng = rand::thread_rng();
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -13,24 +13,24 @@ fn bench_insert(c: &mut Criterion) {
         b.iter(|| {
             let vector: BinaryVector<32> = rng.gen();
             let key = COUNTER.fetch_add(1, Ordering::Relaxed);
-            index.insert(black_box(key), black_box(vector));
+            hnsw.insert(black_box(key), black_box(vector)).unwrap();
         })
     });
 }
 
 fn bench_search(c: &mut Criterion) {
-    let mut index = HNSW::<u32, 32>::new();
+    let mut hnsw = HNSW::<u32, 32>::default();
     let mut rng = rand::thread_rng();
 
     for i in 0..10_000 {
         let vector: BinaryVector<32> = rng.gen();
-        index.insert(i, vector);
+        hnsw.insert(i, vector).unwrap();
     }
 
     c.bench_function("search", |b| {
         b.iter(|| {
             let query: BinaryVector<32> = rng.gen();
-            index.search(black_box(&query), black_box(10));
+            hnsw.search(black_box(&query), black_box(10));
         })
     });
 }

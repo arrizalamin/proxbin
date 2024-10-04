@@ -2,10 +2,11 @@
 
 mod node;
 pub mod params;
+pub mod storage;
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashSet},
     hash::Hash,
     usize, vec,
 };
@@ -13,102 +14,96 @@ use std::{
 use anyhow::{anyhow, Result};
 use rand::Rng;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use self::{node::HNSWNode, params::HNSWParams};
 pub use node::BinaryVector;
-
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct HNSWData<K: Eq + Hash, const N: usize> {
-    nodes: HashMap<K, HNSWNode<K, N>>,
-    entry_point: K,
-}
+use storage::{InMemoryStorage, Storage};
 
 /// Hierarchical Navigable Small World (HNSW) index for binary vectors.
-pub struct HNSW<'a, K: Eq + Hash, const N: usize> {
-    pub data: HNSWData<K, N>,
+pub struct HNSW<'a, K, const N: usize, S: Storage<K, N> = InMemoryStorage<K, N>>
+where
+    K: Eq + Hash,
+    S: Storage<K, N>,
+{
+    pub nodes: S,
+    entry_point: K,
     params: HNSWParams<'a>,
     rng: rand::rngs::StdRng,
     pub deleted_count: usize,
     max_level: usize,
 }
 
-impl<'a, K, const N: usize> HNSW<'a, K, N>
+impl<'a, K, const N: usize, S> Default for HNSW<'a, K, N, S>
 where
     K: Clone + Ord + Eq + Hash + Default,
+    S: Storage<K, N>,
 {
-    /// Creates a new HNSW index with default parameters.
-    pub fn new() -> Self {
-        let params = HNSWParams::default();
-        HNSW {
-            data: HNSWData {
-                nodes: HashMap::new(),
-                entry_point: K::default(),
-            },
-            rng: rand::SeedableRng::seed_from_u64(params.seed),
-            params,
-            deleted_count: 0,
-            max_level: 0,
-        }
+    fn default() -> Self {
+        Self::new(HNSWParams::default())
+    }
+}
+
+impl<'a, K, const N: usize, S> HNSW<'a, K, N, S>
+where
+    K: Clone + Ord + Eq + Hash + Default,
+    S: Storage<K, N>,
+{
+    /// Creates a new HNSW index.
+    pub fn new(params: HNSWParams<'a>) -> Self {
+        Self::new_with_storage(S::default(), params)
     }
 
-    /// Creates a new HNSW index with custom parameters.
-    pub fn new_with_params(params: HNSWParams<'a>) -> Self {
-        HNSW {
-            data: HNSWData {
-                nodes: HashMap::new(),
-                entry_point: K::default(),
-            },
-            rng: rand::SeedableRng::seed_from_u64(params.seed),
-            params,
-            deleted_count: 0,
-            max_level: 0,
+    /// Creates a new HNSW index with custom storage.
+    pub fn new_with_storage(storage: S, params: HNSWParams<'a>) -> Self {
+        let mut entry_point = K::default();
+        let mut deleted_count = 0;
+        let mut max_level = 0;
+        for (key, node) in storage.iter() {
+            let node_level = node.connections.len() - 1;
+            if node_level > max_level {
+                max_level = node_level;
+                entry_point = key.clone();
+            }
+            if node.deleted {
+                deleted_count += 1;
+            }
         }
-    }
-
-    /// Creates a new HNSW index with initial data.
-    pub fn new_with_data(data: HNSWData<K, N>, params: HNSWParams<'a>) -> Self {
         HNSW {
-            data,
+            nodes: storage,
+            entry_point,
             rng: rand::SeedableRng::seed_from_u64(params.seed),
             params,
-            deleted_count: 0,
-            max_level: 0,
+            deleted_count,
+            max_level,
         }
     }
 
     /// Returns an iterator over the nodes in the index.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &HNSWNode<K, N>)> {
-        self.data.nodes.iter()
+        self.nodes.iter()
     }
 
     /// Returns the number of nodes in the index.
     pub fn size(&self) -> usize {
-        self.data.nodes.len() - self.deleted_count
+        self.nodes.len() - self.deleted_count
     }
 
     /// Cleans deleted nodes from the index and reindexes the remaining nodes.
     pub fn reindex(&mut self) {
-        let data = self
-            .data
-            .nodes
-            .drain()
-            .filter(|(_, node)| !node.deleted)
-            .map(|(key, node)| (key, node.vector))
-            .collect::<HashMap<K, BinaryVector<N>>>();
+        let nodes = std::mem::take(&mut self.nodes);
 
-        self.data.nodes = HashMap::new();
-        self.data.entry_point = K::default();
+        self.entry_point = K::default();
         self.deleted_count = 0;
         self.max_level = 0;
 
-        data.into_iter()
-            .for_each(|(key, vector)| self.insert(key, vector));
+        nodes
+            .into_iter()
+            .filter(|(_, node)| !node.deleted)
+            .map(|(key, node)| (key, node.vector))
+            .for_each(|(key, vector)| self.insert(key, vector).unwrap());
     }
 
     /// Inserts a new vector to the index.
-    pub fn insert(&mut self, key: K, vector: BinaryVector<N>) {
+    pub fn insert(&mut self, key: K, vector: BinaryVector<N>) -> Result<()> {
         let node_level = self.random_level();
 
         let new_node = HNSWNode {
@@ -117,19 +112,19 @@ where
             deleted: false,
         };
 
-        self.data.nodes.insert(key.clone(), new_node);
+        self.nodes.insert(key.clone(), new_node)?;
 
-        if self.data.nodes.len() == 1 {
-            self.data.entry_point = key.clone();
+        if self.nodes.len() == 1 {
+            self.entry_point = key.clone();
             self.max_level = node_level;
-            return;
+            return Ok(());
         }
 
-        let mut entry_point = self.data.entry_point.clone();
+        let mut entry_point = self.entry_point.clone();
         let mut entry_point_dist = self
             .params
             .metric
-            .distance(&self.data.nodes[&entry_point].vector, &vector);
+            .distance(&self.nodes[&entry_point].vector, &vector);
 
         for level in (0..=node_level).rev() {
             let (closest, closest_dist, candidates) =
@@ -148,8 +143,10 @@ where
 
         if node_level > self.max_level {
             self.max_level = node_level;
-            self.data.entry_point = key;
+            self.entry_point = key;
         }
+
+        Ok(())
     }
 
     fn find_closest_and_candidates(
@@ -162,7 +159,7 @@ where
             entry_point.clone(),
             self.params
                 .metric
-                .distance(&self.data.nodes[entry_point].vector, vector),
+                .distance(&self.nodes[entry_point].vector, vector),
         );
         let mut candidates = BinaryHeap::new();
         candidates.push(Reverse(current_best.clone()));
@@ -174,13 +171,13 @@ where
                 break;
             }
 
-            if level < self.data.nodes[&current_node].connections.len() {
-                for neighbor in &self.data.nodes[&current_node].connections[level] {
+            if level < self.nodes[&current_node].connections.len() {
+                for neighbor in &self.nodes[&current_node].connections[level] {
                     if visited.insert(neighbor.clone()) {
                         let dist = self
                             .params
                             .metric
-                            .distance(&self.data.nodes[neighbor].vector, vector);
+                            .distance(&self.nodes[neighbor].vector, vector);
                         candidates.push(Reverse((neighbor.clone(), dist)));
                         if dist < current_best.1 {
                             current_best = (neighbor.clone(), dist);
@@ -214,7 +211,7 @@ where
             .collect();
 
         // Add connections to the new node
-        self.data.nodes.get_mut(new_key).unwrap().connections[level] = new_connections.clone();
+        self.nodes[new_key].connections[level] = new_connections.clone();
 
         for conn in &new_connections {
             self.update_reverse_connections(conn, new_key, level);
@@ -222,7 +219,7 @@ where
     }
 
     fn update_reverse_connections(&mut self, conn: &K, new_key: &K, level: usize) {
-        let conn_node = self.data.nodes.get_mut(conn).unwrap();
+        let conn_node = self.nodes.index_mut(conn);
         if conn_node.connections.len() <= level {
             conn_node.connections.resize(level + 1, Vec::new());
         }
@@ -236,19 +233,19 @@ where
     }
 
     fn prune_connections(&mut self, node_key: &K, new_key: &K, level: usize) {
-        let node_vector = &self.data.nodes[node_key].vector;
-        let mut connections = self.data.nodes[node_key].connections[level].clone();
+        let node_vector = &self.nodes[node_key].vector;
+        let mut connections = self.nodes[node_key].connections[level].clone();
         connections.push(new_key.clone());
 
         // Sort connections and keep the closest ones
         connections.sort_by_key(|conn_key| {
             self.params
                 .metric
-                .distance(&self.data.nodes[conn_key].vector, node_vector)
+                .distance(&self.nodes[conn_key].vector, node_vector)
         });
         connections.truncate(self.params.max_connections(level));
 
-        self.data.nodes.get_mut(node_key).unwrap().connections[level] = connections;
+        self.nodes[node_key].connections[level] = connections;
     }
 
     fn random_level(&mut self) -> usize {
@@ -261,7 +258,7 @@ where
 
     /// Removes a vector from the index by its ID and returns the removed vector.
     pub fn remove(&mut self, key: &K) -> Result<BinaryVector<N>> {
-        if let Some(node) = self.data.nodes.get_mut(key) {
+        if let Some(node) = self.nodes.get_mut(key) {
             if node.deleted {
                 return Err(anyhow!("Node already deleted"));
             }
@@ -275,7 +272,7 @@ where
 
     /// Searches for the k nearest neighbors of the query vector.
     pub fn search(&self, query: &BinaryVector<N>, k: usize) -> Vec<(K, BinaryVector<N>, usize)> {
-        if self.data.nodes.is_empty() {
+        if self.nodes.is_empty() {
             return Vec::new();
         }
 
@@ -285,11 +282,11 @@ where
     }
 
     fn find_entry_point(&self, query: &BinaryVector<N>) -> (K, usize) {
-        let mut entry_point = self.data.entry_point.clone();
+        let mut entry_point = self.entry_point.clone();
         let mut entry_point_dist = self
             .params
             .metric
-            .distance(&self.data.nodes[&entry_point].vector, query);
+            .distance(&self.nodes[&entry_point].vector, query);
         let mut current_level = self.max_level; // Use max_level instead of node's max_level
 
         while current_level > 0 {
@@ -312,11 +309,11 @@ where
         let mut changed = true;
         while changed {
             changed = false;
-            for neighbor in &self.data.nodes[entry_point].connections[level] {
+            for neighbor in &self.nodes[entry_point].connections[level] {
                 let dist = self
                     .params
                     .metric
-                    .distance(&self.data.nodes[neighbor].vector, query);
+                    .distance(&self.nodes[neighbor].vector, query);
                 if dist < entry_point_dist {
                     entry_point = neighbor;
                     entry_point_dist = dist;
@@ -343,7 +340,7 @@ where
 
         while results.len() < k && !candidates.is_empty() {
             if let Some(Reverse((dist, node_key))) = candidates.pop() {
-                let node = &self.data.nodes[&node_key];
+                let node = &self.nodes[&node_key];
                 if !node.deleted {
                     results.push((node_key.clone(), node.vector, dist));
                 }
@@ -353,7 +350,7 @@ where
                         let neighbor_dist = self
                             .params
                             .metric
-                            .distance(&self.data.nodes[neighbor].vector, query);
+                            .distance(&self.nodes[neighbor].vector, query);
                         candidates.push(Reverse((neighbor_dist, neighbor.clone())));
                     }
                 }
@@ -372,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_simple_add_and_search() {
-        let mut hnsw = HNSW::<usize, 2>::new_with_params(
+        let mut hnsw = HNSW::<usize, 2>::new(
             HNSWParams::default()
                 .with_max_connections(5)
                 .with_ef_construction(10)
@@ -384,9 +381,9 @@ mod tests {
         let v2 = [0b11111111, 0b00000000];
         let v3 = [0b01010101, 0b01010101];
 
-        hnsw.insert(0, v1);
-        hnsw.insert(1, v2);
-        hnsw.insert(2, v3);
+        hnsw.insert(0, v1).unwrap();
+        hnsw.insert(1, v2).unwrap();
+        hnsw.insert(2, v3).unwrap();
 
         let query = [0b00000000, 0b11111111];
         let results = hnsw.search(&query, 2);
@@ -398,14 +395,16 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut hnsw = HNSW::new();
+        let mut hnsw: HNSW<'_, usize, 2, InMemoryStorage<_, 2>> = HNSW::default();
         let v1 = [0b00000000, 0b11111111];
         let v2 = [0b11111111, 0b00000000];
         let v3 = [0b01010101, 0b01010101];
 
-        hnsw.insert(0, v1);
-        hnsw.insert(1, v2);
-        hnsw.insert(2, v3);
+        hnsw.insert(0, v1).unwrap();
+        hnsw.insert(1, v2).unwrap();
+        hnsw.insert(2, v3).unwrap();
+
+        println!("{:?}", hnsw.nodes[&1]);
 
         let removed_vector = hnsw.remove(&1).unwrap();
         assert_eq!(removed_vector, v2);
@@ -420,15 +419,15 @@ mod tests {
 
     #[test]
     fn test_remove_empty() {
-        let mut hnsw: HNSW<usize, 2> = HNSW::new();
+        let mut hnsw: HNSW<'_, usize, 2, InMemoryStorage<_, 2>> = HNSW::default();
         assert!(hnsw.remove(&0).is_err());
     }
 
     #[test]
     fn test_remove_single_node() {
-        let mut hnsw: HNSW<usize, 2> = HNSW::new();
+        let mut hnsw: HNSW<'_, usize, 2, InMemoryStorage<_, 2>> = HNSW::default();
         let vector = [0b00000000, 0b11111111];
-        hnsw.insert(0, vector.clone());
+        hnsw.insert(0, vector.clone()).unwrap();
         let removed_vector = hnsw.remove(&0).unwrap();
         assert_eq!(removed_vector, vector);
         assert_eq!(hnsw.size(), 0);
@@ -436,37 +435,37 @@ mod tests {
 
     #[test]
     fn test_reindex() {
-        let mut hnsw: HNSW<usize, 2> = HNSW::new();
+        let mut hnsw: HNSW<'_, usize, 2, InMemoryStorage<_, 2>> = HNSW::default();
         let v1 = [0b00000000, 0b11111111];
         let v2 = [0b11111111, 0b00000000];
         let v3 = [0b01010101, 0b01010101];
         let v4 = [0b10101010, 0b10101010];
 
-        hnsw.insert(0, v1);
-        hnsw.insert(1, v2);
-        hnsw.insert(2, v3);
-        hnsw.insert(3, v4);
+        hnsw.insert(0, v1).unwrap();
+        hnsw.insert(1, v2).unwrap();
+        hnsw.insert(2, v3).unwrap();
+        hnsw.insert(3, v4).unwrap();
 
         assert!(hnsw.remove(&1).is_ok());
         assert!(hnsw.remove(&3).is_ok());
         assert_eq!(hnsw.size(), 2);
-        assert_eq!(hnsw.data.nodes.len(), 4);
+        assert_eq!(hnsw.nodes.len(), 4);
 
         hnsw.reindex();
 
-        assert_eq!(hnsw.data.nodes.len(), 2);
-        assert!(!hnsw.data.nodes.contains_key(&1));
-        assert!(!hnsw.data.nodes.contains_key(&3));
-        assert!(hnsw.data.nodes.contains_key(&0));
-        assert!(hnsw.data.nodes.contains_key(&2));
+        assert_eq!(hnsw.nodes.len(), 2);
+        assert!(!hnsw.nodes.contains_key(&1));
+        assert!(!hnsw.nodes.contains_key(&3));
+        assert!(hnsw.nodes.contains_key(&0));
+        assert!(hnsw.nodes.contains_key(&2));
 
         // Check that the entry point is still valid
-        assert!(hnsw.data.nodes.contains_key(&hnsw.data.entry_point));
+        assert!(hnsw.nodes.contains_key(&hnsw.entry_point));
     }
 
     #[test]
     fn test_complex_add_and_search() {
-        let mut index = HNSW::<usize, 4>::new_with_params(
+        let mut hnsw = HNSW::<usize, 4>::new(
             HNSWParams::default()
                 .with_max_connections(10)
                 .with_ef_construction(20)
@@ -478,13 +477,13 @@ mod tests {
         // Add 100 random vectors
         for i in 0..100 {
             let vector: BinaryVector<4> = rng.gen();
-            index.insert(i, vector);
+            hnsw.insert(i, vector).unwrap();
         }
 
         let known_vector = [0b01010101, 0b10101010, 0b00001111, 0b11110000];
-        index.insert(100, known_vector);
+        hnsw.insert(100, known_vector).unwrap();
 
-        let results = index.search(&known_vector, 5);
+        let results = hnsw.search(&known_vector, 5);
 
         assert_eq!(results[0], (100, known_vector, 0));
 
@@ -493,7 +492,7 @@ mod tests {
         }
 
         let random_query: BinaryVector<4> = rng.gen();
-        let random_results = index.search(&random_query, 10);
+        let random_results = hnsw.search(&random_query, 10);
 
         for i in 1..random_results.len() {
             assert!(random_results[i].2 >= random_results[i - 1].2);

@@ -1,5 +1,7 @@
 //! HNSWNode structure.
 
+use std::hash::Hash;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +10,8 @@ pub type BinaryVector<const N: usize> = [u8; N];
 
 /// A node in the HNSW graph.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct HNSWNode<K, const N: usize> {
+#[derive(Debug)]
+pub struct HNSWNode<K: Eq + Hash, const N: usize> {
     #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub vector: BinaryVector<N>,
     pub connections: Vec<Vec<K>>,
