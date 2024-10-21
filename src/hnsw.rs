@@ -13,15 +13,21 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
+#[cfg(feature = "serde")]
+use serde::Serialize;
 
 use self::{node::HNSWNode, params::HNSWParams};
 pub use node::BinaryVector;
 use storage::{InMemoryStorage, Storage};
 
 /// Hierarchical Navigable Small World (HNSW) index for binary vectors.
-pub struct HNSW<'a, K, const N: usize, S: Storage<K, N> = InMemoryStorage<K, N>>
-where
-    K: Eq + Hash,
+pub struct HNSW<
+    'a,
+    #[cfg(not(feature = "serde"))] K: Eq + Hash,
+    #[cfg(feature = "serde")] K: Eq + Hash + Serialize,
+    const N: usize,
+    S: Storage<K, N> = InMemoryStorage<K, N>,
+> where
     S: Storage<K, N>,
 {
     pub nodes: S,
@@ -32,9 +38,14 @@ where
     max_level: usize,
 }
 
-impl<'a, K, const N: usize, S> Default for HNSW<'a, K, N, S>
+impl<
+        'a,
+        #[cfg(not(feature = "serde"))] K: Clone + Ord + Eq + Hash + Default,
+        #[cfg(feature = "serde")] K: Clone + Ord + Eq + Hash + Default + Serialize,
+        const N: usize,
+        S,
+    > Default for HNSW<'a, K, N, S>
 where
-    K: Clone + Ord + Eq + Hash + Default,
     S: Storage<K, N>,
 {
     fn default() -> Self {
@@ -42,9 +53,14 @@ where
     }
 }
 
-impl<'a, K, const N: usize, S> HNSW<'a, K, N, S>
+impl<
+        'a,
+        #[cfg(not(feature = "serde"))] K: Clone + Ord + Eq + Hash + Default,
+        #[cfg(feature = "serde")] K: Clone + Ord + Eq + Hash + Default + Serialize,
+        const N: usize,
+        S,
+    > HNSW<'a, K, N, S>
 where
-    K: Clone + Ord + Eq + Hash + Default,
     S: Storage<K, N>,
 {
     /// Creates a new HNSW index.
